@@ -52,6 +52,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const STATUS_LIMIT_BAR_SEGMENTS: usize = 20;
@@ -331,6 +332,7 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
     PrefixedBlock::new("  └ ", "    "),
     5,
 );
+const COMMAND_CONTINUATION_SECOND_LINE_MAX_GLYPHS: usize = 30;
 impl HistoryCell for ExecCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         if self.is_exploring_cell() {
@@ -530,7 +532,8 @@ impl ExecCell {
             );
             let mut first_wrapped_iter = first_wrapped.into_iter();
             if let Some(first_segment) = first_wrapped_iter.next() {
-                header_line.extend(first_segment);
+                let first_segment_text = Self::line_to_plain_string(&first_segment);
+                header_line.push_span(Span::from(first_segment_text));
             }
             continuation_lines.extend(first_wrapped_iter);
 
@@ -544,13 +547,36 @@ impl ExecCell {
 
         lines.push(header_line);
 
-        let continuation_lines = Self::limit_lines_from_start(
-            &continuation_lines,
-            layout.command_continuation_max_lines,
-        );
         if !continuation_lines.is_empty() {
+            let continuation_text: Vec<String> = continuation_lines
+                .iter()
+                .map(Self::line_to_plain_string)
+                .collect();
+            let omitted_count = continuation_text
+                .len()
+                .saturating_sub(layout.command_continuation_max_lines);
+
+            let displayed: Vec<Line<'static>> = continuation_text
+                .into_iter()
+                .take(layout.command_continuation_max_lines)
+                .enumerate()
+                .map(|(idx, text)| {
+                    if idx == 1 {
+                        let maybe_truncated = Self::truncate_second_line(&text);
+                        Line::from(maybe_truncated)
+                    } else {
+                        Line::from(text)
+                    }
+                })
+                .collect();
+
+            let mut continuation_block = displayed;
+            if omitted_count > 0 {
+                continuation_block.push(Self::ellipsis_line(omitted_count, false, None));
+            }
+
             lines.extend(prefix_lines(
-                continuation_lines,
+                continuation_block,
                 Span::from(layout.command_continuation.initial_prefix).dim(),
                 Span::from(layout.command_continuation.subsequent_prefix).dim(),
             ));
@@ -570,38 +596,20 @@ impl ExecCell {
 
             let mut wrapped_output: Vec<Line<'static>> = Vec::new();
             let output_wrap_width = layout.output_block.wrap_width(width);
-            let output_opts = crate::wrapping::RtOptions::new(output_wrap_width)
-                .word_splitter(WordSplitter::NoHyphenation);
             for line in trimmed_output {
-                push_owned_lines(
-                    &crate::wrapping::word_wrap_line(&line, output_opts.clone()),
-                    &mut wrapped_output,
-                );
+                wrapped_output.push(Self::truncate_line_for_width(&line, output_wrap_width));
             }
 
             if !wrapped_output.is_empty() {
                 lines.extend(prefix_lines(
                     wrapped_output,
                     Span::from(layout.output_block.initial_prefix).dim(),
-                    Span::from(layout.output_block.subsequent_prefix),
+                    Span::from(layout.output_block.subsequent_prefix).dim(),
                 ));
             }
         }
 
         lines
-    }
-
-    fn limit_lines_from_start(lines: &[Line<'static>], keep: usize) -> Vec<Line<'static>> {
-        if lines.len() <= keep {
-            return lines.to_vec();
-        }
-        if keep == 0 {
-            return vec![Self::ellipsis_line(lines.len())];
-        }
-
-        let mut out: Vec<Line<'static>> = lines[..keep].to_vec();
-        out.push(Self::ellipsis_line(lines.len() - keep));
-        out
     }
 
     fn truncate_lines_middle(lines: &[Line<'static>], max: usize) -> Vec<Line<'static>> {
@@ -611,36 +619,18 @@ impl ExecCell {
         if lines.len() <= max {
             return lines.to_vec();
         }
-        if max == 1 {
-            let omitted = lines.iter().map(Self::line_real_count).sum();
-            return vec![Self::ellipsis_line(omitted)];
+
+        let keep = max.saturating_sub(1);
+        let indent_hint = Self::leading_whitespace_from_lines(lines);
+        if keep == 0 {
+            let omitted: usize = lines.iter().map(Self::line_real_count).sum();
+            return vec![Self::ellipsis_line(omitted, true, indent_hint.as_deref())];
         }
 
-        let head = (max - 1) / 2;
-        let tail = max - head - 1;
-        let mut out: Vec<Line<'static>> = Vec::new();
-
-        if head > 0 {
-            out.extend(lines[..head].iter().cloned());
-        }
-
-        let middle_start = head;
-        let middle_end = lines.len().saturating_sub(tail);
-        let omitted: usize = lines[middle_start..middle_end]
-            .iter()
-            .map(Self::line_real_count)
-            .sum();
-        out.push(Self::ellipsis_line(omitted));
-
-        if tail > 0 {
-            out.extend(lines[lines.len() - tail..].iter().cloned());
-        }
-
+        let mut out: Vec<Line<'static>> = lines[..keep].to_vec();
+        let omitted: usize = lines[keep..].iter().map(Self::line_real_count).sum();
+        out.push(Self::ellipsis_line(omitted, true, indent_hint.as_deref()));
         out
-    }
-
-    fn line_real_count(line: &Line<'static>) -> usize {
-        Self::ellipsis_omitted_count(line).unwrap_or(1)
     }
 
     fn ellipsis_omitted_count(line: &Line<'static>) -> Option<usize> {
@@ -653,14 +643,155 @@ impl ExecCell {
         trimmed
             .strip_prefix("… +")
             .and_then(|rest| {
-                rest.strip_suffix(" lines")
-                    .or_else(|| rest.strip_suffix(" line"))
+                rest.strip_suffix(" lines (ctrl+t to expand)")
+                    .or_else(|| rest.strip_suffix(" line (ctrl+t to expand)"))
             })
             .and_then(|count| count.parse().ok())
     }
 
-    fn ellipsis_line(omitted: usize) -> Line<'static> {
-        Line::from(vec![format!("… +{omitted} lines").dim()])
+    fn ellipsis_line(omitted: usize, dim: bool, indent: Option<&str>) -> Line<'static> {
+        let base = if omitted == 1 {
+            format!("… +{omitted} line")
+        } else {
+            format!("… +{omitted} lines")
+        };
+        let base = if let Some(indent) = indent {
+            format!("{indent}{base}")
+        } else {
+            base
+        };
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+        if dim {
+            spans.push(base.dim());
+        } else {
+            spans.push(base.into());
+        }
+        spans.push(" (ctrl+t to expand)".dim());
+        Line::from(spans)
+    }
+
+    fn line_real_count(line: &Line<'static>) -> usize {
+        Self::ellipsis_omitted_count(line).unwrap_or(1)
+    }
+
+    fn line_to_plain_string(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn truncate_second_line(text: &str) -> String {
+        let graphemes: Vec<&str> = text.graphemes(true).collect();
+        if graphemes.len() <= COMMAND_CONTINUATION_SECOND_LINE_MAX_GLYPHS {
+            return text.to_string();
+        }
+        let truncated = graphemes[..COMMAND_CONTINUATION_SECOND_LINE_MAX_GLYPHS].concat();
+        format!("{truncated}...")
+    }
+
+    fn leading_whitespace_from_lines(lines: &[Line<'static>]) -> Option<String> {
+        lines
+            .iter()
+            .filter_map(Self::leading_whitespace_from_line)
+            .next()
+    }
+
+    fn leading_whitespace_from_line(line: &Line<'_>) -> Option<String> {
+        let mut collected = String::new();
+        for span in &line.spans {
+            let text = span.content.as_ref();
+            for ch in text.chars() {
+                if ch == ' ' {
+                    collected.push(' ');
+                } else if ch == '\t' {
+                    collected.push('\t');
+                } else {
+                    return if collected.is_empty() {
+                        None
+                    } else {
+                        Some(collected)
+                    };
+                }
+            }
+            if !text.chars().all(|c| c == ' ' || c == '\t') {
+                break;
+            }
+        }
+        if collected.is_empty() {
+            None
+        } else {
+            Some(collected)
+        }
+    }
+
+    fn leading_whitespace_str(text: &str) -> Option<String> {
+        let whitespace: String = text
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        if whitespace.is_empty() {
+            None
+        } else {
+            Some(whitespace)
+        }
+    }
+
+    fn line_display_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    fn truncate_line_for_width(line: &Line<'static>, max_width: usize) -> Line<'static> {
+        if max_width == 0 {
+            return Line::from("");
+        }
+
+        let original_width = Self::line_display_width(line);
+        if original_width <= max_width {
+            return line.clone();
+        }
+
+        if max_width <= 3 {
+            return Line::from("...");
+        }
+
+        let target_width = max_width.saturating_sub(3);
+        let mut remaining = target_width;
+        let mut truncated_spans: Vec<Span<'static>> = Vec::new();
+
+        for span in &line.spans {
+            if remaining == 0 {
+                break;
+            }
+
+            let mut collected = String::new();
+            for grapheme in span.content.as_ref().graphemes(true) {
+                let g_width = UnicodeWidthStr::width(grapheme);
+                if g_width > remaining {
+                    break;
+                }
+                collected.push_str(grapheme);
+                remaining -= g_width;
+                if remaining == 0 {
+                    break;
+                }
+            }
+
+            if !collected.is_empty() {
+                truncated_spans.push(Span::styled(collected, span.style));
+            }
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        let mut truncated_line = Line::from(truncated_spans);
+        truncated_line.push_span(Span::from("..."));
+        truncated_line
     }
 }
 
@@ -1696,49 +1827,55 @@ fn output_lines(output: Option<&CommandOutput>, params: OutputLinesParams) -> Ve
 
     let src = if *exit_code == 0 { stdout } else { stderr };
     let lines: Vec<&str> = src.lines().collect();
-    let total = lines.len();
     let limit = TOOL_CALL_MAX_LINES;
 
     let mut out = Vec::new();
 
-    let head_end = total.min(limit);
-    for (i, raw) in lines[..head_end].iter().enumerate() {
-        let mut line = ansi_escape_line(raw);
-        let prefix = if !include_prefix {
-            ""
-        } else if i == 0 && include_angle_pipe {
-            "  └ "
-        } else {
-            "    "
-        };
-        line.spans.insert(0, prefix.into());
-        line.spans.iter_mut().for_each(|span| {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        });
+    if lines.is_empty() {
+        let mut line = Line::from("(No output)".dim());
+        if include_prefix {
+            let prefix = if include_angle_pipe { "  └ " } else { "    " };
+            line.spans.insert(0, prefix.into());
+        }
         out.push(line);
+        return out;
     }
 
-    // If we will ellipsize less than the limit, just show it.
-    let show_ellipsis = total > 2 * limit;
-    if show_ellipsis {
-        let omitted = total - 2 * limit;
-        out.push(format!("… +{omitted} lines").into());
-    }
-
-    let tail_start = if show_ellipsis {
-        total - limit
-    } else {
-        head_end
-    };
-    for raw in lines[tail_start..].iter() {
+    let display_count = lines.len().min(limit);
+    let indent_hint_str = lines
+        .iter()
+        .take(display_count)
+        .rev()
+        .find_map(|raw| ExecCell::leading_whitespace_str(raw));
+    for (i, raw) in lines.iter().take(display_count).enumerate() {
         let mut line = ansi_escape_line(raw);
         if include_prefix {
-            line.spans.insert(0, "    ".into());
+            let prefix = if i == 0 && include_angle_pipe {
+                "  └ "
+            } else {
+                "    "
+            };
+            line.spans.insert(0, prefix.into());
         }
         line.spans.iter_mut().for_each(|span| {
             span.style = span.style.add_modifier(Modifier::DIM);
         });
         out.push(line);
+    }
+
+    if lines.len() > display_count {
+        let mut ellipsis_line = ExecCell::ellipsis_line(
+            lines.len() - display_count,
+            true,
+            indent_hint_str.as_deref(),
+        );
+        if include_prefix {
+            ellipsis_line.spans.insert(0, "    ".into());
+            ellipsis_line.spans.iter_mut().for_each(|span| {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            });
+        }
+        out.push(ellipsis_line);
     }
 
     out
@@ -1889,9 +2026,9 @@ mod tests {
             vec![
                 "line 0".to_string(),
                 "line 1".to_string(),
-                "… +16 lines".to_string(),
-                "line 18".to_string(),
-                "line 19".to_string(),
+                "line 2".to_string(),
+                "line 3".to_string(),
+                "… +16 lines (ctrl+t to expand)".to_string(),
             ],
         );
     }
